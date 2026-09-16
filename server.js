@@ -8,10 +8,10 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ১. ফ্রন্টএন্ড পরিবেশন (index.html এবং ইমেজ ফাইলগুলো লোড করার জন্য)
-app.use(express.static(path.join(__dirname, '/')));
+// ১. ফ্রন্টএন্ড ফাইল পরিবেশন (index.html লোড করার জন্য)
+app.use(express.static(path.join(__dirname, './')));
 
-// ২. ডামি ডাটা এবং সেটিং API (যাতে অ্যাপ ওপেন হওয়ার সময় ডাটা পায়)
+// ২. ডাটা এবং সেটিংস API
 app.get('/api/data', (req, res) => {
     res.json({
         success: true,
@@ -28,8 +28,8 @@ app.get('/api/data', (req, res) => {
             usdRate: 125,
             coinSystemEnabled: true,
             paymentMethods: [
-                { id: 'bk', name: 'Bkash', number: '01766952732' },
-                { id: 'ng', name: 'Nagad', number: '01766952732' }
+                { id: 'bk', name: 'Bkash', number: '01712345678' },
+                { id: 'ng', name: 'Nagad', number: '01712345678' }
             ]
         },
         products: [
@@ -43,25 +43,17 @@ app.get('/api/data', (req, res) => {
                     { name: '1 Month', price: 50 },
                     { name: '1 Year', price: 350 }
                 ]
-            },
-            {
-                id: 'proxy-1',
-                name: 'Residential Proxy',
-                category: 'proxy',
-                pricePerGb: 150,
-                stock: true
             }
         ],
         orders: []
     });
-};
+});
 
 // ৩. অর্ডার সাবমিট API
 app.post('/api/orders', (req, res) => {
     const orderData = req.body;
     console.log("New Order Received:", orderData);
     
-    // সফল রেসপন্স পাঠানো
     res.json({
         success: true,
         order: {
@@ -81,11 +73,11 @@ app.post('/api/verify-screenshot', (req, res) => {
     });
 });
 
-// রুট রাউট (index.html লোড করা)
+// ফলব্যাক রুট (index.html রিটার্ন করার জন্য)
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server is running successfully on port ${PORT}`);
 });
