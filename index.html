@@ -19,45 +19,6 @@
     <meta property="og:type" content="website">
     <meta name="theme-color" content="#3b82f6">
     <script src="https://cdn.tailwindcss.com"></script>
-const tg = window.Telegram?.WebApp;
-
-if (tg) {
-    tg.ready();
-    tg.expand();
-}
-
-// Auto-Sync User Session with Fallback
-async function syncUser() {
-    const user = tg?.initDataUnsafe?.user || {
-        id: "12345678",
-        first_name: "Guest",
-        username: "guest_user"
-    };
-
-    try {
-        const res = await fetch('/api/auth/sync', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                tgId: user.id,
-                firstName: user.first_name,
-                username: user.username
-            })
-        });
-        const data = await res.json();
-        if (data.success) {
-            localStorage.setItem('tg_token', data.token);
-            document.getElementById('user-balance').innerText = `৳ ${data.user.balance || 0}`;
-        }
-    } catch (err) {
-        console.warn("Backend sync failed, running in guest mode.");
-    }
-}
-
-// Page Load Handler
-window.addEventListener('DOMContentLoaded', () => {
-    syncUser();
-});
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet" />
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
