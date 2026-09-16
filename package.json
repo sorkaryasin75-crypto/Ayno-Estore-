@@ -1,13 +1,25 @@
 {
-  "name": "ayno-store-backend",
+  "name": "ayno-store",
   "version": "1.0.0",
-  "description": "AyNo Store Telegram Mini App Backend",
+  "description": "Ayno Store - Premium Digital Services Platform & Telegram Admin System",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
     "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
