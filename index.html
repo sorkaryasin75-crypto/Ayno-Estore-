@@ -12,14 +12,6 @@
         content="Buy Premium VPN in Bangladesh using bKash and Nagad. Get NordVPN, ExpressVPN, Proxies, and Digital Subscriptions at AyNo Store. Instant automated delivery.">
     <meta name="keywords" content="premium vpn buy in bangladesh, nordvpn buy in bangladesh, expressvpn buy bangladesh, protonvpn bangladesh, pia vpn buy bd, hma vpn buy, surfshark vpn bd, cyberghost vpn buy, vpn buy using bkash, vpn buy using nagad, netflix premium buy bd, spotify premium bangladesh, canva pro buy bkash, youtube premium bd, telegram premium buy bangladesh, outlook mail buy, hotmail buy, outlook.fr mail buy, edu mail buy bd, gmail accounts buy, proxy buy in bangladesh, residential proxy bd, socks5 proxy buy, static residential proxy, virtual number buy bd, sms verification bangladesh, temp number buy bd, google voice buy bd, vps buy bkash, rdp buy bangladesh, premium digital services bd, ayno store, aynostore, digital subscriptions bangladesh">
     <script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "Organization",
-  "url": "https://aynostore.shop",
-  "logo": "https://i.ibb.co/68Z4T4S/ayno.png",
-  "name": "AyNo Store",
-  "sameAs": ["https://t.me/Ayno_Store"]
-}
 </script>
     <meta property="og:title" content="AyNo Store - Premium Digital Services">
     <meta property="og:description"
@@ -27,6 +19,45 @@
     <meta property="og:type" content="website">
     <meta name="theme-color" content="#3b82f6">
     <script src="https://cdn.tailwindcss.com"></script>
+const tg = window.Telegram?.WebApp;
+
+if (tg) {
+    tg.ready();
+    tg.expand();
+}
+
+// Auto-Sync User Session with Fallback
+async function syncUser() {
+    const user = tg?.initDataUnsafe?.user || {
+        id: "12345678",
+        first_name: "Guest",
+        username: "guest_user"
+    };
+
+    try {
+        const res = await fetch('/api/auth/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                tgId: user.id,
+                firstName: user.first_name,
+                username: user.username
+            })
+        });
+        const data = await res.json();
+        if (data.success) {
+            localStorage.setItem('tg_token', data.token);
+            document.getElementById('user-balance').innerText = `৳ ${data.user.balance || 0}`;
+        }
+    } catch (err) {
+        console.warn("Backend sync failed, running in guest mode.");
+    }
+}
+
+// Page Load Handler
+window.addEventListener('DOMContentLoaded', () => {
+    syncUser();
+});
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet" />
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
