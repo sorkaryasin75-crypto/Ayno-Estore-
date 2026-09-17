@@ -9,6 +9,9 @@ const multer = require('multer');
 const TelegramBot = require('node-telegram-bot-api');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const AynoStorage = require('./storage');
+const SmsBowerProvider = require('./providers/smsbower');
 require('dotenv').config();
 
 const app = express();
@@ -24,11 +27,13 @@ const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, '
 const DATA_FILE = path.resolve(process.env.DATA_FILE || path.join(__dirname, 'data.json'));
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 const AUTO_APPROVE_UPLOADS = String(process.env.AUTO_APPROVE_UPLOADS || 'false').toLowerCase() === 'true';
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const SMSBOWER_API_KEY = process.env.SMSBOWER_API_KEY || '';
 const SMSBOWER_API_URL = process.env.SMSBOWER_API_URL || 'https://smsbower.online';
+const smsProvider = new SmsBowerProvider({ apiKey: SMSBOWER_API_KEY, baseUrl: SMSBOWER_API_URL });
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -50,25 +55,22 @@ const defaults = {
   smsServices:[], smsCountries:{},
 };
 let db = loadData();
+const storage = new AynoStorage({ dataFile: DATA_FILE, defaults });
 function loadData(){
   try {
     if(fs.existsSync(DATA_FILE)) {
       const parsed=JSON.parse(fs.readFileSync(DATA_FILE,'utf8'));
       const merged={...defaults,...parsed};
-      for(const k of Object.keys(defaults)) if(merged[k]===undefined) merged[k]=defaults[k];
+      for(const k of Object.keys(defaults)) if(merged[k]===undefined) merged[k]=JSON.parse(JSON.stringify(defaults[k]));
       merged.settings={...defaults.settings,...(parsed.settings||{})};
-      merged.products=Array.isArray(parsed.products)?parsed.products:defaults.products;
+      merged.products=Array.isArray(parsed.products)?parsed.products:JSON.parse(JSON.stringify(defaultProducts));
       return merged;
     }
-  } catch(e){ console.error('Data load failed:',e.message); }
-  writeData(defaults); return JSON.parse(JSON.stringify(defaults));
+  } catch(e){ console.error('[storage] Data load failed:',e.message); }
+  return JSON.parse(JSON.stringify(defaults));
 }
-let saveTimer=null;
-function writeData(data=db){
-  try { const tmp=DATA_FILE+'.tmp'; fs.writeFileSync(tmp,JSON.stringify(data,null,2)); fs.renameSync(tmp,DATA_FILE); }
-  catch(e){ console.error('Data save failed:',e.message); }
-}
-function saveData(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>writeData(),150); }
+function saveData(){ storage.schedule(db); }
+
 function now(){return new Date().toISOString();}
 function id(prefix){return prefix+Date.now().toString(36)+crypto.randomBytes(3).toString('hex');}
 function bearer(req){ const h=req.headers.authorization||''; return h.startsWith('Bearer ')?h.slice(7):null; }
@@ -81,21 +83,31 @@ function authenticate(req,res,next){
 function requireAdmin(req,res,next){ if(req.dbUser?.role!=='admin' && !ADMIN_IDS.has(String(req.user?.tgId))) return res.status(403).json({success:false,error:'Admin access required'}); next(); }
 function sanitizeText(v,max=500){return String(v??'').replace(/[<>]/g,'').trim().slice(0,max);}
 function safeNumber(v,min=0){const n=Number(v); return Number.isFinite(n)&&n>=min?n:null;}
+const ORDER_TRANSITIONS={Pending:['Processing','Cancelled'],Processing:['PendingProvider','Completed','Failed','Cancelled'],PendingProvider:['Processing','Completed','Failed','Cancelled'],Failed:[],Cancelled:[],Completed:['Delivered'],Delivered:[]};
+function canTransition(from,to){return from===to || (ORDER_TRANSITIONS[from]||[]).includes(to);}
+function idemKey(req){return String(req.headers['idempotency-key']||req.body?.idempotencyKey||'').trim();}
+async function claimIdem(req,res){const key=idemKey(req);if(!key)return true;const ok=await storage.claimIdempotency(key,req.user?.tgId||'anonymous',req.path);if(!ok){res.status(409).json({success:false,error:'Duplicate request: Idempotency-Key already used'});return false;}return true;}
+function syncBalance(user,balance){user.balance=Math.round(Number(balance)*100)/100;return user.balance;}
+async function walletChange(req,res,{delta,type,refId,meta={}}){try{const r=await storage.atomicChange({tgId:req.dbUser.tgId,delta,type,refId,meta,fallbackBalance:req.dbUser.balance});syncBalance(req.dbUser,r.balance);return r;}catch(e){if(e.code==='INSUFFICIENT_BALANCE'){res.status(400).json({success:false,error:'Insufficient balance'});return null;}throw e;}}
+function audit(action,req,targetId,meta={}){db.logs.push({type:'audit',action,actorId:String(req.user?.tgId||req.dbUser?.tgId||''),targetId:targetId?String(targetId):null,route:req.path,meta,timestamp:now()});db.logs=db.logs.slice(-1000);storage.audit({actorId:req.user?.tgId||req.dbUser?.tgId,action,route:req.path,targetId,meta}).catch(e=>console.warn('[audit]',e.message));}
+
 
 app.set('trust proxy',1); app.disable('x-powered-by');
-app.use(helmet({contentSecurityPolicy:false}));
-app.use(cors({origin:true,credentials:false}));
+app.use(helmet({contentSecurityPolicy:false,crossOriginResourcePolicy:{policy:'cross-origin'}}));
+app.use(compression());
+const allowedOrigins=(process.env.ALLOWED_ORIGINS||'').split(',').map(s=>s.trim()).filter(Boolean);
+app.use(cors({origin:(origin,cb)=>{if(!origin||allowedOrigins.length===0||allowedOrigins.includes(origin))return cb(null,true);return cb(new Error('CORS origin denied'));},credentials:false}));
 app.use(express.json({limit:'10mb'})); app.use(express.urlencoded({extended:true,limit:'10mb'})); app.use(morgan('tiny'));
 const limiter=rateLimit({windowMs:15*60*1000,max:200,standardHeaders:true,legacyHeaders:false});
 const authLimiter=rateLimit({windowMs:15*60*1000,max:20,standardHeaders:true,legacyHeaders:false});
 app.use('/api/',limiter);
-app.use(express.static(__dirname,{maxAge:'1h'}));
+app.use(express.static(__dirname,{maxAge:'1h',setHeaders:(res,file)=>{if(/\.(svg|png|jpg|jpeg|webp|ico|css|js)$/.test(file))res.setHeader('Cache-Control','public,max-age=86400');else res.setHeader('Cache-Control','no-cache');}}));
 app.use('/uploads',express.static(UPLOAD_DIR,{maxAge:'7d',fallthrough:false}));
 
 app.get('/',(req,res)=>res.sendFile(path.join(__dirname,'index.html')));
-app.get('/health',(req,res)=>res.json({status:'OK',uptime:process.uptime(),timestamp:now(),maintenance:!!db.settings.maintenance}));
+app.get('/health',(req,res)=>res.status(200).json({status:'OK',ready:storage.ready,uptime:process.uptime(),timestamp:now(),maintenance:!!db.settings.maintenance,database:storage.enabled?'postgres':'json'}));
 app.head('/health',(req,res)=>res.status(200).end());
-app.get('/api/health',(req,res)=>res.json({status:'healthy',server:'running',database:'file-json',timestamp:now(),version:'2.0.0'}));
+app.get('/api/health',(req,res)=>res.json({status:'healthy',server:'running',database:storage.enabled?'postgres':'json',timestamp:now(),version:'2.0.0'}));
 
 function telegramValidate(initData){
   if(!initData || !TELEGRAM_BOT_TOKEN) return null;
@@ -119,6 +131,7 @@ app.post('/api/auth/sync',authLimiter,(req,res)=>{const b=req.body||{};const tgI
 function publicUser(u){if(!u)return null;const {backupKey,...safe}=u;return safe;}
 function userOrders(uid){return db.orders.filter(o=>String(o.userId)===String(uid)).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));}
 app.get('/api/data',(req,res)=>{let user=null;if(bearer(req)){try{const p=jwt.verify(bearer(req),EFFECTIVE_JWT_SECRET);user=publicUser(db.users[String(p.tgId)]);}catch{}}const orders=user?userOrders(user.tgId):[];res.json({success:true,user,products:db.products,settings:db.settings,orders,withdrawals:user?db.withdrawals.filter(w=>String(w.userId)===String(user.tgId)):[],transfers:user?db.transfers.filter(t=>String(t.senderTgId)===String(user.tgId)||String(t.receiverTgId)===String(user.tgId)):[],coupons:[],stocks:{},mailStockSummary:{},webNotifications:user?.webNotifications||[],timestamp:now()});});
+app.get('/api/system-status',(req,res)=>res.json({success:true,version:'3.0.0',database:storage.enabled?'postgresql':'json-fallback',providers:{smsbower:smsProvider.configured()},features:{idempotency:true,walletLedger:storage.enabled,auditLog:storage.enabled,orderStateMachine:true},timestamp:now()}));
 app.get('/api/app-data',(req,res)=>res.json({success:true,products:db.products,settings:db.settings,timestamp:now()}));
 
 app.get('/api/orders',authenticate,(req,res)=>res.json({success:true,orders:userOrders(req.dbUser.tgId)}));
@@ -130,33 +143,52 @@ app.post('/api/orders',authenticate,(req,res)=>{
 });
 app.delete('/api/orders/:id',authenticate,(req,res)=>{const i=db.orders.findIndex(o=>o.id===req.params.id&&String(o.userId)===String(req.dbUser.tgId));if(i<0)return res.status(404).json({success:false,error:'Order not found'});if(['Completed','Delivered'].includes(db.orders[i].status))return res.status(400).json({success:false,error:'Completed orders cannot be deleted'});db.orders.splice(i,1);saveData();res.json({success:true});});
 
-const storage=multer.diskStorage({destination:UPLOAD_DIR,filename:(req,file,cb)=>cb(null,Date.now()+'-'+crypto.randomBytes(8).toString('hex')+path.extname(file.originalname).toLowerCase())});
-const upload=multer({storage,limits:{fileSize:5*1024*1024},fileFilter:(req,file,cb)=>{const ok=['.png','.jpg','.jpeg','.webp'].includes(path.extname(file.originalname).toLowerCase());cb(ok?null:new Error('Only JPEG, PNG and WebP images are allowed'),ok);}});
-app.post('/api/verify-screenshot',authenticate,upload.single('screenshot'),(req,res)=>{if(!req.file)return res.status(400).json({success:false,error:'No screenshot uploaded'});const v={id:id('V'),userId:String(req.dbUser.tgId),filename:req.file.filename,originalName:req.file.originalname,path:'/uploads/'+req.file.filename,status:AUTO_APPROVE_UPLOADS?'Approved':'Manual_Review',createdAt:now()};db.verifications.push(v);if(AUTO_APPROVE_UPLOADS){const credit=Number(process.env.AUTO_APPROVE_CREDIT||0);req.dbUser.balance+=credit;}saveData();res.json({success:true,status:v.status,newBalance:req.dbUser.balance,verification:v});});
+const uploadStorage=multer.diskStorage({destination:UPLOAD_DIR,filename:(req,file,cb)=>cb(null,Date.now()+'-'+crypto.randomBytes(8).toString('hex')+path.extname(file.originalname).toLowerCase())});
+const upload=multer({storage:uploadStorage,limits:{fileSize:5*1024*1024},fileFilter:(req,file,cb)=>{const ok=['.png','.jpg','.jpeg','.webp'].includes(path.extname(file.originalname).toLowerCase());cb(ok?null:new Error('Only JPEG, PNG and WebP images are allowed'),ok);}});
+app.post('/api/verify-screenshot',authenticate,upload.single('screenshot'),async(req,res)=>{if(!req.file)return res.status(400).json({success:false,error:'No screenshot uploaded'});const v={id:id('V'),userId:String(req.dbUser.tgId),filename:req.file.filename,originalName:req.file.originalname,path:'/uploads/'+req.file.filename,status:AUTO_APPROVE_UPLOADS?'Approved':'Manual_Review',createdAt:now()};db.verifications.push(v);if(AUTO_APPROVE_UPLOADS){const credit=Number(process.env.AUTO_APPROVE_CREDIT||0);if(credit>0){const r=await walletChange(req,res,{delta:credit,type:'verification_credit',refId:v.id});if(!r)return;}}saveData();res.json({success:true,status:v.status,newBalance:req.dbUser.balance,verification:v});});
 app.post('/api/user/avatar',authenticate,upload.single('avatar'),(req,res)=>{if(!req.file)return res.status(400).json({success:false,error:'No avatar uploaded'});req.dbUser.photoUrl='/uploads/'+req.file.filename;saveData();res.json({success:true,photoUrl:req.dbUser.photoUrl,user:publicUser(req.dbUser)});});
 
 function findOrder(id1,uid){return db.orders.find(o=>(o.id===id1||o.externalOrderId===id1)&&String(o.userId)===String(uid));}
-app.post('/api/buy-external',authenticate,async(req,res)=>{const b=req.body||{};const price=safeNumber(b.price);if(!b.externalId||price===null)return res.status(400).json({success:false,error:'externalId and valid price are required'});if(req.dbUser.balance<price)return res.status(400).json({success:false,error:'Insufficient balance'});const order={id:id('EXT'),userId:String(req.dbUser.tgId),tgId:String(req.dbUser.tgId),item:sanitizeText(b.itemName||b.externalId,300),price,method:'Wallet',status:'Processing',category:b.externalType||'external',externalType:b.externalType||'',externalId:String(b.externalId),service:b.service||'',country:b.country||'',providerId:b.providerId||'',createdAt:now(),updatedAt:now()};req.dbUser.balance-=price;db.orders.push(order);saveData();res.status(201).json({success:true,order,user:publicUser(req.dbUser),providerConfigured:!!SMSBOWER_API_KEY});});
-app.post('/api/get-otp',authenticate,(req,res)=>{const o=findOrder(req.body?.orderId,req.dbUser.tgId);if(!o)return res.status(404).json({success:false,error:'Order not found'});if(!SMSBOWER_API_KEY)return res.json({success:false,status:o.status,error:'SMS provider is not configured'});res.json({success:false,status:o.status,error:'OTP polling adapter is not configured for this provider'});});
-app.post('/api/cancel-order',authenticate,(req,res)=>{const o=findOrder(req.body?.internalOrderId||req.body?.orderId,req.dbUser.tgId);if(!o)return res.status(404).json({success:false,error:'Order not found'});if(['Completed','Delivered'].includes(o.status))return res.status(400).json({success:false,error:'Completed order cannot be cancelled'});o.status='Cancelled';if(o.method==='Wallet'){req.dbUser.balance+=Number(o.price||0);}o.updatedAt=now();saveData();res.json({success:true,order:o,newBalance:req.dbUser.balance});});
-app.post('/api/complete-order',authenticate,(req,res)=>{const o=findOrder(req.body?.internalOrderId||req.body?.orderId,req.dbUser.tgId);if(!o)return res.status(404).json({success:false,error:'Order not found'});o.status='Completed';o.updatedAt=now();saveData();res.json({success:true,order:o});});
+app.post('/api/buy-external',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const b=req.body||{};const price=safeNumber(b.price);if(!b.externalId||price===null)return res.status(400).json({success:false,error:'externalId and valid price are required'});const order={id:id('EXT'),userId:String(req.dbUser.tgId),tgId:String(req.dbUser.tgId),item:sanitizeText(b.itemName||b.externalId,300),price,method:'Wallet',status:'PendingProvider',category:b.externalType||'external',externalType:b.externalType||'',externalId:String(b.externalId),service:sanitizeText(b.service,100),country:sanitizeText(b.country,50),providerId:sanitizeText(b.providerId,100),createdAt:now(),updatedAt:now()};const w=await walletChange(req,res,{delta:-price,type:'external_purchase',refId:order.id,meta:{externalId:order.externalId,providerId:order.providerId}});if(!w)return;
+  if(order.providerId.toLowerCase()==='smsbower' || order.providerId.toLowerCase()==='smsbower.online'){
+    if(!smsProvider.configured()){await walletChange(req,res,{delta:price,type:'provider_refund',refId:order.id,meta:{reason:'provider_not_configured'}});return res.status(503).json({success:false,error:'SMS provider is not configured'});}
+    try{
+      const providerResult=await smsProvider.getNumber({service:order.service,country:order.country});
+      order.providerRaw=providerResult.raw;
+      const m=String(providerResult.raw).match(/^ACCESS_NUMBER:([^:]+):(.+)$/);
+      if(m){order.activationId=m[1];order.number=m[2];order.status='Processing';}
+      else {order.status='Failed';await walletChange(req,res,{delta:price,type:'provider_refund',refId:order.id,meta:{reason:'provider_rejected',raw:providerResult.raw}});}
+    }catch(e){order.status='Failed';await walletChange(req,res,{delta:price,type:'provider_refund',refId:order.id,meta:{reason:'provider_error'}});order.providerError=process.env.NODE_ENV==='production'?'Provider request failed':e.message;}
+  }
+  db.orders.push(order);saveData();audit('wallet_purchase',req,order.id,{amount:price,externalId:order.externalId,status:order.status});res.status(order.status==='Failed'?502:201).json({success:order.status!=='Failed',order,user:publicUser(req.dbUser),providerConfigured:smsProvider.configured()});});
+app.post('/api/get-otp',authenticate,async(req,res)=>{const o=findOrder(req.body?.orderId,req.dbUser.tgId);if(!o)return res.status(404).json({success:false,error:'Order not found'});if(!smsProvider.configured())return res.status(503).json({success:false,status:o.status,error:'SMS provider is not configured'});const activationId=req.body?.activationId||o.activationId||o.externalId;if(!activationId)return res.status(400).json({success:false,error:'activationId is required'});try{const result=await smsProvider.getStatus({activationId});o.providerStatus=result.raw;o.updatedAt=now();saveData();return res.json({success:true,status:o.status,providerStatus:result.raw});}catch(e){return res.status(502).json({success:false,status:o.status,error:'SMS provider request failed',detail:process.env.NODE_ENV==='production'?undefined:e.message});}});
+app.post('/api/cancel-order',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const o=findOrder(req.body?.internalOrderId||req.body?.orderId,req.dbUser.tgId);if(!o)return res.status(404).json({success:false,error:'Order not found'});if(!canTransition(o.status,'Cancelled'))return res.status(400).json({success:false,error:`Order cannot transition from ${o.status} to Cancelled`});o.status='Cancelled';if(o.method==='Wallet'){const w=await walletChange(req,res,{delta:Number(o.price||0),type:'order_refund',refId:o.id});if(!w)return;}o.updatedAt=now();saveData();audit('order_cancelled',req,o.id,{refund:o.method==='Wallet'?Number(o.price||0):0});res.json({success:true,order:o,newBalance:req.dbUser.balance});});
+app.post('/api/complete-order',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const o=findOrder(req.body?.internalOrderId||req.body?.orderId,req.dbUser.tgId);if(!o)return res.status(404).json({success:false,error:'Order not found'});if(!canTransition(o.status,'Completed'))return res.status(400).json({success:false,error:`Order cannot transition from ${o.status} to Completed`});o.status='Completed';o.updatedAt=now();saveData();audit('order_completed',req,o.id);res.json({success:true,order:o});});
+
+app.get('/api/ledger',authenticate,async(req,res)=>{
+  if(!storage.pool) return res.json({success:true,ledger:[],message:'PostgreSQL ledger is disabled; JSON fallback is active'});
+  try {
+    const r=await storage.pool.query('SELECT id,amount,direction,type,ref_id AS "refId",balance_after AS "balanceAfter",meta,created_at AS "createdAt" FROM ayno_wallet_ledger WHERE tg_id=$1 ORDER BY created_at DESC LIMIT 200',[String(req.dbUser.tgId)]);
+    res.json({success:true,ledger:r.rows});
+  } catch(e) { res.status(500).json({success:false,error:'Ledger unavailable'}); }
+});
 
 app.get('/api/reviews/:productId',(req,res)=>res.json({success:true,reviews:db.reviews.filter(r=>String(r.productId)===String(req.params.productId))}));
 app.post('/api/reviews',authenticate,(req,res)=>{const b=req.body||{};const rating=Math.max(1,Math.min(5,Number(b.rating)||0));if(!b.productId||!rating)return res.status(400).json({success:false,error:'Product and rating required'});const r={id:id('R'),productId:String(b.productId),userId:String(req.dbUser.tgId),userName:sanitizeText(req.dbUser.firstName,80),rating,comment:sanitizeText(b.comment,500),date:now()};db.reviews.push(r);saveData();res.status(201).json({success:true,review:r});});
 
-app.post('/api/withdraw',authenticate,(req,res)=>{const b=req.body||{};const amount=safeNumber(b.amount,1);if(amount===null||amount<Number(db.settings.minWithdraw||50))return res.status(400).json({success:false,error:`Minimum withdrawal is ${db.settings.minWithdraw||50}`});if(req.dbUser.balance<amount)return res.status(400).json({success:false,error:'Insufficient balance'});if(!b.accountNumber)return res.status(400).json({success:false,error:'Account number required'});req.dbUser.balance-=amount;const w={id:id('W'),userId:String(req.dbUser.tgId),amount,type:sanitizeText(b.type,40),method:sanitizeText(b.method,60),accountNumber:sanitizeText(b.accountNumber,50),status:'Pending',createdAt:now()};db.withdrawals.push(w);saveData();res.json({success:true,withdrawal:w,newBalance:req.dbUser.balance});});
-app.post('/api/transfer',authenticate,(req,res)=>{const amount=safeNumber(req.body?.amount,1),receiver=String(req.body?.receiverTgId||'');if(!receiver||amount===null)return res.status(400).json({success:false,error:'Receiver and amount required'});const r=db.users[receiver];if(!r)return res.status(404).json({success:false,error:'Receiver not found'});if(String(r.tgId)===String(req.dbUser.tgId))return res.status(400).json({success:false,error:'Cannot transfer to yourself'});if(req.dbUser.balance<amount)return res.status(400).json({success:false,error:'Insufficient balance'});req.dbUser.balance-=amount;r.balance=(r.balance||0)+amount;const t={id:id('T'),senderTgId:String(req.dbUser.tgId),receiverTgId:receiver,amount,createdAt:now()};db.transfers.push(t);saveData();res.json({success:true,transfer:t,newBalance:req.dbUser.balance});});
+app.post('/api/withdraw',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const b=req.body||{};const amount=safeNumber(b.amount,1);if(amount===null||amount<Number(db.settings.minWithdraw||50))return res.status(400).json({success:false,error:`Minimum withdrawal is ${db.settings.minWithdraw||50}`});if(!b.accountNumber)return res.status(400).json({success:false,error:'Account number required'});const w={id:id('W'),userId:String(req.dbUser.tgId),amount,type:sanitizeText(b.type,40),method:sanitizeText(b.method,60),accountNumber:sanitizeText(b.accountNumber,50),status:'Pending',createdAt:now()};const r=await walletChange(req,res,{delta:-amount,type:'withdrawal_hold',refId:w.id,meta:{method:w.method,accountNumber:w.accountNumber}});if(!r)return;db.withdrawals.push(w);saveData();audit('withdrawal_created',req,w.id,{amount,method:w.method});res.json({success:true,withdrawal:w,newBalance:req.dbUser.balance});});
+app.post('/api/transfer',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const amount=safeNumber(req.body?.amount,1),receiver=String(req.body?.receiverTgId||'');if(!receiver||amount===null)return res.status(400).json({success:false,error:'Receiver and amount required'});const r=db.users[receiver];if(!r)return res.status(404).json({success:false,error:'Receiver not found'});if(String(r.tgId)===String(req.dbUser.tgId))return res.status(400).json({success:false,error:'Cannot transfer to yourself'});try{const t={id:id('T'),senderTgId:String(req.dbUser.tgId),receiverTgId:receiver,amount,createdAt:now()};const result=await storage.atomicTransfer({fromId:req.dbUser.tgId,toId:receiver,amount,fromFallback:req.dbUser.balance,toFallback:r.balance,refId:t.id,meta:{route:req.path}});syncBalance(req.dbUser,result.fromBalance);syncBalance(r,result.toBalance);db.transfers.push(t);saveData();audit('wallet_transfer',req,t.id,{amount,receiver});res.json({success:true,transfer:t,newBalance:req.dbUser.balance});}catch(e){if(e.code==='INSUFFICIENT_BALANCE')return res.status(400).json({success:false,error:'Insufficient balance'});throw e;}});
 app.get('/api/users/search',authenticate,(req,res)=>{const q=String(req.query.q||'').toLowerCase().replace('@','');const users=Object.values(db.users).filter(u=>String(u.username||'').toLowerCase().includes(q)&&String(u.tgId)!==String(req.dbUser.tgId)).slice(0,10).map(publicUser);res.json({success:true,users});});
 
 app.post('/api/user/notifications/ack',authenticate,(req,res)=>{req.dbUser.webNotifications=[];saveData();res.json({success:true});});
 app.post('/api/user/vpn-expiry/ack',authenticate,(req,res)=>{res.json({success:true});});
 app.get('/api/user/backup-key',authenticate,(req,res)=>res.json({success:true,backupKey:req.dbUser.backupKey}));
 
-app.post('/api/reward/claim',authenticate,(req,res)=>{if(!db.settings.rewardEnabled)return res.status(400).json({success:false,error:'Reward disabled'});if(req.dbUser.rewardClaimed)return res.status(400).json({success:false,error:'Reward already claimed'});req.dbUser.rewardClaimed=true;const coupon={id:id('C'),code:'WELCOME-'+crypto.randomBytes(3).toString('hex').toUpperCase(),type:'fixed',value:5,userId:String(req.dbUser.tgId),expiresAt:new Date(Date.now()+7*86400000).toISOString()};db.coupons.push(coupon);saveData();res.json({success:true,coupon,discountFixed:5});});
+app.post('/api/reward/claim',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;if(!db.settings.rewardEnabled)return res.status(400).json({success:false,error:'Reward disabled'});if(req.dbUser.rewardClaimed)return res.status(400).json({success:false,error:'Reward already claimed'});req.dbUser.rewardClaimed=true;const coupon={id:id('C'),code:'WELCOME-'+crypto.randomBytes(3).toString('hex').toUpperCase(),type:'fixed',value:5,userId:String(req.dbUser.tgId),expiresAt:new Date(Date.now()+7*86400000).toISOString()};db.coupons.push(coupon);saveData();audit('reward_claimed',req,coupon.id);res.json({success:true,coupon,discountFixed:5});});
 app.post('/api/reward/ignore',authenticate,(req,res)=>{req.dbUser.rewardIgnored=true;saveData();res.json({success:true});});
 app.post('/api/loyalty/checkin',authenticate,(req,res)=>{const day=new Date().toISOString().slice(0,10);if(req.dbUser.lastCheckin===day)return res.status(400).json({success:false,error:'Already checked in today'});req.dbUser.lastCheckin=day;req.dbUser.loyaltyPoints=(req.dbUser.loyaltyPoints||0)+10;saveData();res.json({success:true,pointsEarned:10,loyaltyPoints:req.dbUser.loyaltyPoints});});
-app.post('/api/loyalty/redeem',authenticate,(req,res)=>{const points=Math.floor(Number(req.body?.points)||0);if(points<1000||points>Number(req.dbUser.loyaltyPoints||0))return res.status(400).json({success:false,error:'Invalid points amount'});const amount=points/1000;req.dbUser.loyaltyPoints-=points;req.dbUser.balance+=amount;saveData();res.json({success:true,amountAdded:amount,newBalance:req.dbUser.balance,remainingPoints:req.dbUser.loyaltyPoints});});
-app.post('/api/loyalty/scratch',authenticate,(req,res)=>{const reward=5;req.dbUser.balance+=reward;saveData();res.json({success:true,reward,amountAdded:reward,newBalance:req.dbUser.balance});});
+app.post('/api/loyalty/redeem',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const points=Math.floor(Number(req.body?.points)||0);if(points<1000||points>Number(req.dbUser.loyaltyPoints||0))return res.status(400).json({success:false,error:'Invalid points amount'});const amount=points/1000;req.dbUser.loyaltyPoints-=points;const r=await walletChange(req,res,{delta:amount,type:'loyalty_redeem',refId:id('LP'),meta:{points}});if(!r)return;saveData();res.json({success:true,amountAdded:amount,newBalance:req.dbUser.balance,remainingPoints:req.dbUser.loyaltyPoints});});
+app.post('/api/loyalty/scratch',authenticate,async(req,res)=>{if(!(await claimIdem(req,res)))return;const reward=5;const r=await walletChange(req,res,{delta:reward,type:'loyalty_scratch',refId:id('SCR')});if(!r)return;saveData();res.json({success:true,reward,amountAdded:reward,newBalance:req.dbUser.balance});});
 app.get('/api/leaderboard',(req,res)=>{if(db.settings.leaderboardEnabled===false)return res.json({enabled:false,leaders:[]});const leaders=Object.values(db.users).sort((a,b)=>(b.totalEarned||0)-(a.totalEarned||0)).slice(0,20).map(u=>({tgId:u.tgId,username:u.username,firstName:u.firstName,totalEarned:u.totalEarned||0}));res.json({success:true,enabled:true,leaders});});
 
 app.post('/api/mail/inbox',authenticate,(req,res)=>res.json({success:false,error:'Mail inbox provider is not configured'}));
@@ -177,9 +209,9 @@ app.post('/api/admin/products',authenticate,requireAdmin,(req,res)=>{const b=req
 app.patch('/api/admin/products/:id',authenticate,requireAdmin,(req,res)=>{const p=db.products.find(x=>x.id===req.params.id);if(!p)return res.status(404).json({success:false,error:'Product not found'});const b=req.body||{};for(const k of ['name','category','logoUrl','iconClass','bgClass'])if(b[k]!==undefined)p[k]=sanitizeText(b[k],500);for(const k of ['price','pricePerGb'])if(b[k]!==undefined){const n=safeNumber(b[k],0);if(n===null)return res.status(400).json({success:false,error:`Invalid ${k}`});p[k]=n;}for(const k of ['stock','isAvailable','isHidden'])if(b[k]!==undefined)p[k]=!!b[k];if(Array.isArray(b.plans))p.plans=b.plans;saveData();res.json({success:true,product:p});});
 app.delete('/api/admin/products/:id',authenticate,requireAdmin,(req,res)=>{const i=db.products.findIndex(p=>p.id===req.params.id);if(i<0)return res.status(404).json({success:false,error:'Product not found'});db.products.splice(i,1);saveData();res.json({success:true});});
 app.get('/api/admin/orders',authenticate,requireAdmin,(req,res)=>res.json({success:true,orders:db.orders.slice().reverse()}));
-app.patch('/api/admin/orders/:id',authenticate,requireAdmin,(req,res)=>{const o=db.orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({success:false,error:'Order not found'});const status=sanitizeText(req.body?.status,50);if(status)o.status=status;o.updatedAt=now();if(req.body?.note!==undefined)o.adminNote=sanitizeText(req.body.note,500);saveData();res.json({success:true,order:o});});
+app.patch('/api/admin/orders/:id',authenticate,requireAdmin,async(req,res)=>{if(!(await claimIdem(req,res)))return;const o=db.orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({success:false,error:'Order not found'});const status=sanitizeText(req.body?.status,50);if(status&&!canTransition(o.status,status))return res.status(400).json({success:false,error:`Invalid order transition ${o.status} -> ${status}`});if(status)o.status=status;o.updatedAt=now();if(req.body?.note!==undefined)o.adminNote=sanitizeText(req.body.note,500);saveData();audit('order_status_changed',req,o.id,{status});res.json({success:true,order:o});});
 app.get('/api/admin/withdrawals',authenticate,requireAdmin,(req,res)=>res.json({success:true,withdrawals:db.withdrawals.slice().reverse()}));
-app.patch('/api/admin/withdrawals/:id',authenticate,requireAdmin,(req,res)=>{const w=db.withdrawals.find(x=>x.id===req.params.id);if(!w)return res.status(404).json({success:false,error:'Withdrawal not found'});const old=w.status;w.status=sanitizeText(req.body?.status||w.status,30);w.adminNote=sanitizeText(req.body?.note||'',500);if(old==='Pending'&&['Rejected','Cancelled'].includes(w.status)){const u=db.users[w.userId];if(u)u.balance+=Number(w.amount||0);}saveData();res.json({success:true,withdrawal:w});});
+app.patch('/api/admin/withdrawals/:id',authenticate,requireAdmin,async(req,res)=>{if(!(await claimIdem(req,res)))return;const w=db.withdrawals.find(x=>x.id===req.params.id);if(!w)return res.status(404).json({success:false,error:'Withdrawal not found'});const old=w.status;const next=sanitizeText(req.body?.status||w.status,30);const allowed=['Pending','Processing','Paid','Rejected','Cancelled'];if(!allowed.includes(next))return res.status(400).json({success:false,error:'Invalid withdrawal status'});w.status=next;w.adminNote=sanitizeText(req.body?.note||'',500);if(old==='Pending'&&['Rejected','Cancelled'].includes(next)){const u=db.users[w.userId];if(u){const r=await storage.atomicChange({tgId:u.tgId,delta:Number(w.amount||0),type:'withdrawal_refund',refId:w.id,fallbackBalance:u.balance});syncBalance(u,r.balance);}}w.updatedAt=now();saveData();audit('withdrawal_status_changed',req,w.id,{from:old,to:next});res.json({success:true,withdrawal:w});});
 app.get('/api/admin/verifications',authenticate,requireAdmin,(req,res)=>res.json({success:true,verifications:db.verifications.slice().reverse()}));
 app.patch('/api/admin/verifications/:id',authenticate,requireAdmin,(req,res)=>{const v=db.verifications.find(x=>x.id===req.params.id);if(!v)return res.status(404).json({success:false,error:'Verification not found'});v.status=sanitizeText(req.body?.status||v.status,30);if(req.body?.credit!==undefined){const n=safeNumber(req.body.credit,0);if(n!==null&&v.status==='Approved'&&!v.credited){const u=db.users[v.userId];if(u){u.balance+=n;v.credited=true;v.credit=n;}}}saveData();res.json({success:true,verification:v});});
 app.get('/api/admin/reviews',authenticate,requireAdmin,(req,res)=>res.json({success:true,reviews:db.reviews.slice().reverse()}));
@@ -195,11 +227,53 @@ app.post('/api/admin/sms-services',authenticate,requireAdmin,(req,res)=>{db.smsS
 app.post('/api/logs/error',(req,res)=>{const b=req.body||{};db.logs.push({type:sanitizeText(b.type,50),message:sanitizeText(b.message,500),stack:sanitizeText(b.stack,2000),timestamp:b.timestamp||now()});db.logs=db.logs.slice(-500);saveData();res.json({success:true});});
 
 let bot=null;
-if(TELEGRAM_BOT_TOKEN){try{if(WEBHOOK_URL){bot=new TelegramBot(TELEGRAM_BOT_TOKEN);bot.setWebHook(`${WEBHOOK_URL.replace(/\/$/,'')}/bot${TELEGRAM_BOT_TOKEN}`).catch(e=>console.warn('Webhook:',e.message));}else{bot=new TelegramBot(TELEGRAM_BOT_TOKEN,{polling:true});}}catch(e){console.warn('Telegram bot disabled:',e.message);}}
+if(TELEGRAM_BOT_TOKEN && WEBHOOK_URL){
+  app.post('/telegram/webhook', express.json({limit:'256kb'}), (req,res)=>{
+    try { if(TELEGRAM_WEBHOOK_SECRET && req.headers['x-telegram-bot-api-secret-token']!==TELEGRAM_WEBHOOK_SECRET) return res.sendStatus(403); if (bot) bot.processUpdate(req.body); res.sendStatus(200); }
+    catch (e) { console.error('[telegram] webhook error:', e.message); res.sendStatus(200); }
+  });
+}
+if(TELEGRAM_BOT_TOKEN){
+  try {
+    if(WEBHOOK_URL){
+      bot=new TelegramBot(TELEGRAM_BOT_TOKEN);
+      const webhookEndpoint=`${WEBHOOK_URL.replace(/\/$/,'')}/telegram/webhook`;
+      bot.setWebHook(webhookEndpoint, TELEGRAM_WEBHOOK_SECRET ? {secret_token: TELEGRAM_WEBHOOK_SECRET, drop_pending_updates: false} : {drop_pending_updates: false}).then(()=>console.log('[telegram] Webhook:',webhookEndpoint)).catch(e=>console.warn('[telegram] Webhook setup:',e.message));
+    } else {
+      bot=new TelegramBot(TELEGRAM_BOT_TOKEN,{polling:{params:{timeout:25},autoStart:true}});
+    }
+  } catch(e) { console.warn('[telegram] bot disabled:',e.message); }
+}
 if(bot){bot.onText(/\/start/,msg=>{if(msg.chat?.id){upsertUser({id:msg.from.id,first_name:msg.from.first_name,last_name:msg.from.last_name,username:msg.from.username});bot.sendMessage(msg.chat.id,'Ayno Store is ready. Open the Web App from the configured Telegram button.').catch(()=>{});}});}
 
 app.use((req,res)=>{if(req.path.startsWith('/api/'))return res.status(404).json({success:false,error:'API endpoint not found',path:req.path});res.sendFile(path.join(__dirname,'index.html'));});
 app.use((err,req,res,next)=>{console.error('🔥 Server Error:',err.stack||err);res.status(err.status||500).json({success:false,error:process.env.NODE_ENV==='production'?'Internal server error':err.message});});
-const server=app.listen(PORT,HOST,()=>console.log(`Ayno Store production server listening on ${HOST}:${PORT}`));
-function shutdown(){server.close(()=>{writeData();process.exit(0);});}
-process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
+let server;
+let shuttingDown=false;
+async function start(){
+  try {
+    db=await storage.init();
+    server=app.listen(PORT,HOST,()=>console.log(`Ayno Store production server listening on ${HOST}:${PORT}`));
+    server.keepAliveTimeout=65000;
+    server.headersTimeout=66000;
+  } catch(e) { console.error('[startup] Fatal:',e.stack||e); process.exit(1); }
+}
+async function shutdown(signal){
+  if(shuttingDown)return;
+  shuttingDown=true;
+  console.log(`[shutdown] Received ${signal}`);
+  const force=setTimeout(()=>{console.error('[shutdown] Forced exit');process.exit(1)},10000);
+  force.unref();
+  try {
+    if(bot){try{if(typeof bot.stopPolling==='function')await bot.stopPolling();}catch(e){console.warn('[telegram] stop warning:',e.message);}}
+    if(server) await new Promise(resolve=>server.close(()=>resolve()));
+    await storage.flush(db);
+    await storage.close();
+    clearTimeout(force);
+    console.log('[shutdown] Clean shutdown complete');
+    process.exit(0);
+  } catch(e) { console.error('[shutdown] Error:',e.stack||e); clearTimeout(force); process.exit(1); }
+}
+process.once('SIGTERM',()=>shutdown('SIGTERM'));
+process.once('SIGINT',()=>shutdown('SIGINT'));
+start();
