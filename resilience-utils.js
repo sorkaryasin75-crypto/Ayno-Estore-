@@ -104,7 +104,7 @@ function showNotification(message, type = 'info', duration = 4000) {
     };
     
     notification.style.cssText = `
-        background: ${bgColors[type] || bgColors['info'}};
+        background: ${bgColors[type] || bgColors['info']};
         color: white;
         padding: 16px;
         border-radius: 8px;
