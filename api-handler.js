@@ -1,527 +1,456 @@
 /**
  * ============================================================================
- * AYNO STORE - API HANDLER WITH RAILWAY SERVER FALLBACK & OFFLINE SUPPORT
+ * AYNO STORE - FULL SYSTEM CONTROL & API HANDLER (PROD & ASYNC READY)
  * ============================================================================
- * Handles:
- * - Railway server downtime detection
- * - Automatic fallback to cached/mock data
- * - Retry logic with exponential backoff
- * - Network status monitoring
- * - Queue pending operations
- * - Auto-sync when server comes back online
+ * Features Included:
+ * - Client-Side Resilience & Offline Sync Queue
+ * - Telegram WebApp HMAC SHA-256 Authentication & JWT Engine
+ * - Full Async System Control Admin API Endpoints:
+ *     1. POST /api/auth/telegram-login
+ *     2. GET  /api/admin/dashboard-stats
+ *     3. POST /api/admin/user/update-balance
+ *     4. GET  /api/admin/orders/pending
+ *     5. POST /api/admin/orders/manage
+ * - Health Check & System Status
  * ============================================================================
  */
 
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+
+// Global Configurations
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const JWT_SECRET = process.env.JWT_SECRET || 'ayno_store_super_secret_jwt_key_2026';
+const ADMIN_TELEGRAM_IDS = [6246632270]; // Authorized Admin Telegram UIDs
+
 const API_CONFIG = {
-    BASE_URL: process.env.REACT_APP_API_URL || window.location.origin,
+    BASE_URL: process.env.REACT_APP_API_URL || (typeof window !== 'undefined' ? window.location.origin : ''),
     TIMEOUT: 15000,
     RETRY_MAX: 3,
     RETRY_DELAY: 2000,
     HEALTH_CHECK_INTERVAL: 30000,
-    CACHE_DURATION: 60000 * 5 // 5 minutes
+    CACHE_DURATION: 60000 * 5 // 5 Minutes
 };
+
+// ============================================================================
+// PART 1: BACKEND SECURITY & ADMIN MIDDLEWARE (EXPRESS SERVER SIDE)
+// ============================================================================
+
+/**
+ * Validates Telegram WebApp initData with HMAC SHA-256
+ */
+const verifyTelegramInitData = (initData) => {
+    if (!initData) return false;
+    try {
+        const urlParams = new URLSearchParams(initData);
+        const hash = urlParams.get('hash');
+        urlParams.delete('hash');
+
+        const dataCheckString = Array.from(urlParams.entries())
+            .map(([key, value]) => `${key}=${value}`)
+            .sort()
+            .join('\n');
+
+        const secretKey = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+        const calculatedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+        if (calculatedHash !== hash) return false;
+
+        const userObj = JSON.parse(urlParams.get('user') || '{}');
+        return userObj;
+    } catch (err) {
+        return false;
+    }
+};
+
+/**
+ * Admin Security Guard Middleware
+ */
+const requireAdminAuth = async (req, res, next) => {
+    try {
+        const initData = req.headers['x-telegram-init-data'];
+        const authHeader = req.headers['authorization'];
+
+        let tgUser = verifyTelegramInitData(initData);
+
+        if (!tgUser && authHeader && authHeader.startsWith('Bearer ')) {
+            const token = authHeader.split(' ')[1];
+            const decoded = jwt.verify(token, JWT_SECRET);
+            tgUser = { id: decoded.tgId };
+        }
+
+        if (!tgUser || !tgUser.id) {
+            return res.status(401).json({ success: false, message: "Unauthorized: Invalid Telegram Auth Data" });
+        }
+
+        if (!ADMIN_TELEGRAM_IDS.includes(Number(tgUser.id))) {
+            return res.status(403).json({ success: false, message: "Access Denied: Admin privileges required" });
+        }
+
+        req.adminUser = tgUser;
+        next();
+    } catch (error) {
+        return res.status(401).json({ success: false, message: "Authentication Error: " + error.message });
+    }
+};
+
+/**
+ * Express Router Binding for System Control API
+ */
+const registerExpressRoutes = (app) => {
+    const express = require('express');
+    const router = express.Router();
+
+    // 1. Health Check Endpoint
+    router.head('/health', (req, res) => res.status(200).end());
+    router.get('/health', (req, res) => res.json({ status: "healthy", timestamp: new Date().toISOString() }));
+
+    // 2. Telegram WebApp Auto Login
+    router.post('/auth/telegram-login', async (req, res) => {
+        try {
+            const { initData } = req.body;
+            const tgUser = verifyTelegramInitData(initData);
+
+            if (!tgUser || !tgUser.id) {
+                return res.status(400).json({ success: false, message: "Invalid Telegram Auth Data" });
+            }
+
+            const db = req.app.get('db');
+            let user = await db.collection('users').findOne({ tgId: Number(tgUser.id) });
+
+            if (!user) {
+                const newUser = {
+                    tgId: Number(tgUser.id),
+                    firstName: tgUser.first_name || '',
+                    lastName: tgUser.last_name || '',
+                    username: tgUser.username || '',
+                    balance: 0,
+                    role: ADMIN_TELEGRAM_IDS.includes(Number(tgUser.id)) ? 'admin' : 'user',
+                    createdAt: new Date(),
+                    updatedAt: new Date()
+                };
+
+                const result = await db.collection('users').insertOne(newUser);
+                user = { _id: result.insertedId, ...newUser };
+            } else {
+                await db.collection('users').updateOne(
+                    { tgId: Number(tgUser.id) },
+                    { $set: { firstName: tgUser.first_name, username: tgUser.username, updatedAt: new Date() } }
+                );
+            }
+
+            const token = jwt.sign(
+                { userId: user._id, tgId: user.tgId, role: user.role },
+                JWT_SECRET,
+                { expiresIn: '7d' }
+            );
+
+            res.json({
+                success: true,
+                token,
+                user: {
+                    id: user._id,
+                    tgId: user.tgId,
+                    name: `${user.firstName} ${user.lastName}`.trim(),
+                    username: user.username,
+                    balance: user.balance,
+                    role: user.role
+                }
+            });
+        } catch (err) {
+            res.status(500).json({ success: false, message: "Login Error: " + err.message });
+        }
+    });
+
+    // 3. Admin: Live System Analytics
+    router.get('/admin/dashboard-stats', requireAdminAuth, async (req, res) => {
+        try {
+            const db = req.app.get('db');
+
+            const [totalUsers, pendingOrders, revenueAgg] = await Promise.all([
+                db.collection('users').countDocuments(),
+                db.collection('orders').countDocuments({ status: 'pending' }),
+                db.collection('orders').aggregate([
+                    { $match: { status: 'approved' } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } }
+                ]).toArray()
+            ]);
+
+            const totalRevenue = revenueAgg[0]?.total || 0;
+
+            res.json({
+                success: true,
+                stats: { totalUsers, pendingOrders, totalRevenue, systemStatus: "Active" }
+            });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+
+    // 4. Admin: Balance Control (Add/Cut Money)
+    router.post('/admin/user/update-balance', requireAdminAuth, async (req, res) => {
+        try {
+            const { targetTgId, amount, action } = req.body;
+            if (!targetTgId || !amount || isNaN(amount) || amount <= 0) {
+                return res.status(400).json({ success: false, message: "Invalid parameters" });
+            }
+
+            const db = req.app.get('db');
+            const numericAmount = Number(amount);
+            const increment = action === 'add' ? numericAmount : -numericAmount;
+
+            const updatedUser = await db.collection('users').findOneAndUpdate(
+                { tgId: Number(targetTgId) },
+                { $inc: { balance: increment }, $set: { updatedAt: new Date() } },
+                { returnDocument: 'after' }
+            );
+
+            if (!updatedUser || !updatedUser.value) {
+                return res.status(404).json({ success: false, message: "Target user not found" });
+            }
+
+            res.json({
+                success: true,
+                message: `Balance updated! New Balance: ৳${updatedUser.value.balance}`,
+                newBalance: updatedUser.value.balance
+            });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+
+    // 5. Admin: Get Pending Orders List
+    router.get('/admin/orders/pending', requireAdminAuth, async (req, res) => {
+        try {
+            const db = req.app.get('db');
+            const orders = await db.collection('orders')
+                .find({ status: 'pending' })
+                .sort({ createdAt: -1 })
+                .toArray();
+
+            res.json({ success: true, orders });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+
+    // 6. Admin: Approve / Reject Orders
+    router.post('/admin/orders/manage', requireAdminAuth, async (req, res) => {
+        try {
+            const { orderId, status } = req.body;
+            if (!orderId || !['approved', 'rejected'].includes(status)) {
+                return res.status(400).json({ success: false, message: "Invalid order action" });
+            }
+
+            const db = req.app.get('db');
+            const order = await db.collection('orders').findOne({ _id: orderId });
+
+            if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+
+            await db.collection('orders').updateOne(
+                { _id: orderId },
+                { $set: { status: status, processedBy: req.adminUser.id, updatedAt: new Date() } }
+            );
+
+            // Refund balance on rejection if applicable
+            if (status === 'rejected' && order.paymentMethod === 'balance') {
+                await db.collection('users').updateOne(
+                    { tgId: order.userId },
+                    { $inc: { balance: order.amount } }
+                );
+            }
+
+            res.json({ success: true, message: `Order #${orderId} set to ${status}` });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+
+    app.use('/api', router);
+};
+
+// ============================================================================
+// PART 2: FRONTEND ASYNC CLIENT MANAGER (BROWSER SIDE)
+// ============================================================================
 
 class APIManager {
     constructor() {
         this.cache = new Map();
         this.pendingRequests = [];
         this.serverHealthy = true;
-        this.isOffline = !navigator.onLine;
+        this.isOffline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
         this.circuitBreaker = new Map();
         this.lastHealthCheck = null;
-        
-        this.initializeNetworkListener();
-        this.startHealthMonitor();
-        this.loadPendingRequests();
+
+        if (typeof window !== 'undefined') {
+            this.initializeNetworkListener();
+            this.startHealthMonitor();
+            this.loadPendingRequests();
+        }
     }
-    
-    // ========================================================================
-    // NETWORK STATUS MONITORING
-    // ========================================================================
-    
+
     initializeNetworkListener() {
-        window.addEventListener('online', () => {
+        window.addEventListener('online', async () => {
             this.isOffline = false;
-            console.log('✅ Network: ONLINE');
-            this.onNetworkRestored();
+            await this.syncPendingRequests();
         });
-        
+
         window.addEventListener('offline', () => {
             this.isOffline = true;
-            console.log('⚠️ Network: OFFLINE');
-            this.onNetworkLost();
         });
     }
-    
-    async onNetworkRestored() {
-        showNotification('🌐 Internet connection restored', 'success', 3000);
-        this.updateUI('online');
-        await this.syncPendingRequests();
-    }
-    
-    onNetworkLost() {
-        showNotification('📡 Offline mode - limited functionality', 'warning');
-        this.updateUI('offline');
-    }
-    
-    // ========================================================================
-    // HEALTH CHECK - RAILWAY SERVER STATUS
-    // ========================================================================
-    
+
     startHealthMonitor() {
         this.checkServerHealth();
         setInterval(() => this.checkServerHealth(), API_CONFIG.HEALTH_CHECK_INTERVAL);
     }
-    
+
     async checkServerHealth() {
         try {
-            const response = await this.fetchWithTimeout(`${API_CONFIG.BASE_URL}/api/health`, {
-                method: 'HEAD'
-            }, 5000);
-            
-            const wasUnhealthy = !this.serverHealthy;
+            const response = await this.fetchWithTimeout(`${API_CONFIG.BASE_URL}/api/health`, { method: 'HEAD' }, 5000);
             this.serverHealthy = response.ok;
-            
-            if (wasUnhealthy && this.serverHealthy) {
-                console.log('🚀 Railway Server: BACK ONLINE');
-                await this.syncPendingRequests();
-                this.updateUI('online');
-            } else if (this.serverHealthy) {
-                console.log('✅ Railway Server: HEALTHY');
-            }
+            if (this.serverHealthy) await this.syncPendingRequests();
         } catch (error) {
             this.serverHealthy = false;
-            console.warn('⚠️ Railway Server: UNREACHABLE', error.message);
-            this.updateUI('server-down');
         }
-        
-        this.lastHealthCheck = new Date().toISOString();
     }
-    
-    // ========================================================================
-    // ENHANCED FETCH WITH TIMEOUT
-    // ========================================================================
-    
+
     fetchWithTimeout(url, options = {}, timeoutMs = API_CONFIG.TIMEOUT) {
         return new Promise((resolve, reject) => {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => {
                 controller.abort();
-                reject(new Error(`Request timeout after ${timeoutMs}ms - ${url}`));
+                reject(new Error(`Timeout after ${timeoutMs}ms`));
             }, timeoutMs);
-            
-            fetch(url, {
-                ...options,
-                signal: controller.signal,
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...options.headers
-                }
-            })
-            .then(response => {
-                clearTimeout(timeoutId);
-                resolve(response);
-            })
-            .catch(error => {
-                clearTimeout(timeoutId);
-                reject(error);
-            });
+
+            const headers = {
+                'Content-Type': 'application/json',
+                'x-telegram-init-data': window.Telegram?.WebApp?.initData || '',
+                ...options.headers
+            };
+
+            fetch(url, { ...options, headers, signal: controller.signal })
+                .then(res => { clearTimeout(timeoutId); resolve(res); })
+                .catch(err => { clearTimeout(timeoutId); reject(err); });
         });
     }
-    
-    // ========================================================================
-    // RETRY LOGIC WITH CIRCUIT BREAKER
-    // ========================================================================
-    
-    shouldRetry(endpoint, error) {
-        // Don't retry if it's a client error (4xx)
-        if (error.response?.status >= 400 && error.response?.status < 500) {
-            return false;
-        }
-        
-        // Retry on network errors, timeouts, and server errors (5xx)
-        if (error.message.includes('timeout') || 
-            error.message.includes('Failed to fetch') ||
-            error.response?.status >= 500) {
-            return true;
-        }
-        
-        return false;
-    }
-    
-    getCircuitBreakerStatus(endpoint) {
-        if (!this.circuitBreaker.has(endpoint)) {
-            this.circuitBreaker.set(endpoint, {
-                failures: 0,
-                lastFailure: null,
-                state: 'CLOSED' // CLOSED, OPEN, HALF_OPEN
-            });
-        }
-        return this.circuitBreaker.get(endpoint);
-    }
-    
-    recordFailure(endpoint) {
-        const breaker = this.getCircuitBreakerStatus(endpoint);
-        breaker.failures++;
-        breaker.lastFailure = Date.now();
-        
-        if (breaker.failures >= 5) {
-            breaker.state = 'OPEN';
-            console.warn(`🔴 Circuit breaker OPEN for ${endpoint}`);
-        }
-    }
-    
-    recordSuccess(endpoint) {
-        const breaker = this.getCircuitBreakerStatus(endpoint);
-        breaker.failures = 0;
-        breaker.state = 'CLOSED';
-    }
-    
-    isCircuitBreakerOpen(endpoint) {
-        const breaker = this.getCircuitBreakerStatus(endpoint);
-        
-        if (breaker.state !== 'OPEN') return false;
-        
-        // Try to recover after 30 seconds
-        const timeSinceLastFailure = Date.now() - breaker.lastFailure;
-        if (timeSinceLastFailure > 30000) {
-            breaker.state = 'HALF_OPEN';
-            console.log(`⚡ Circuit breaker HALF_OPEN for ${endpoint} - retrying...`);
-            return false;
-        }
-        
-        return true;
-    }
-    
-    // ========================================================================
-    // MAKE API REQUEST WITH FULL RESILIENCE
-    // ========================================================================
-    
+
     async request(endpoint, options = {}, useCache = true) {
         const fullUrl = `${API_CONFIG.BASE_URL}${endpoint}`;
         const method = (options.method || 'GET').toUpperCase();
         const cacheKey = `${method}:${fullUrl}`;
-        
-        // Check circuit breaker
-        if (this.isCircuitBreakerOpen(endpoint)) {
-            console.warn(`⚠️ Circuit breaker open for ${endpoint}`);
-            const cached = this.getCachedData(cacheKey);
-            if (cached) {
-                showNotification('Using cached data (server unavailable)', 'warning');
-                return cached;
-            }
-            throw new Error(`Server temporarily unavailable for ${endpoint}`);
-        }
-        
-        // If offline, use cache
+
         if (this.isOffline) {
             const cached = this.getCachedData(cacheKey);
-            if (cached) {
-                console.log(`📦 Using cached data (offline): ${endpoint}`);
-                return cached;
-            }
-            throw new Error('Offline and no cached data available');
+            if (cached) return cached;
+            throw new Error('Offline and no cache available');
         }
-        
-        // Retry logic
+
         let lastError;
         for (let attempt = 0; attempt <= API_CONFIG.RETRY_MAX; attempt++) {
             try {
-                const response = await this.fetchWithTimeout(fullUrl, options, API_CONFIG.TIMEOUT);
-                
-                if (!response.ok) {
-                    if (response.status === 503 || response.status === 502 || response.status === 504) {
-                        // Server/gateway error - mark as unhealthy
-                        this.serverHealthy = false;
-                        throw new Error(`Server error ${response.status}: Railway may be down`);
-                    }
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
+                const response = await this.fetchWithTimeout(fullUrl, options);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 
                 const data = await response.json();
-                
-                // Cache successful response
-                if (useCache && method === 'GET') {
-                    this.setCachedData(cacheKey, data);
-                }
-                
-                // Record success
-                this.recordSuccess(endpoint);
+                if (useCache && method === 'GET') this.setCachedData(cacheKey, data);
                 return data;
-                
             } catch (error) {
                 lastError = error;
-                this.recordFailure(endpoint);
-                
-                if (attempt < API_CONFIG.RETRY_MAX && this.shouldRetry(endpoint, error)) {
-                    const delay = API_CONFIG.RETRY_DELAY * Math.pow(2, attempt); // Exponential backoff
-                    console.log(`🔄 Retry ${attempt + 1}/${API_CONFIG.RETRY_MAX} after ${delay}ms: ${endpoint}`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                } else {
-                    break;
+                if (attempt < API_CONFIG.RETRY_MAX) {
+                    await new Promise(r => setTimeout(r, API_CONFIG.RETRY_DELAY * Math.pow(2, attempt)));
                 }
             }
         }
-        
-        // All retries failed - use cache or throw
-        const cached = this.getCachedData(cacheKey);
-        if (cached) {
-            console.warn(`⚠️ Using cached data (request failed): ${endpoint}`);
-            showNotification('Using cached data (connection issue)', 'warning');
-            return cached;
-        }
-        
-        // No cache available
-        throw lastError || new Error(`Failed to fetch ${endpoint}`);
+        throw lastError;
     }
-    
-    // ========================================================================
-    // CACHING
-    // ========================================================================
-    
+
     setCachedData(key, data) {
-        this.cache.set(key, {
-            data,
-            timestamp: Date.now()
-        });
+        this.cache.set(key, { data, timestamp: Date.now() });
     }
-    
+
     getCachedData(key) {
         const item = this.cache.get(key);
         if (!item) return null;
-        
-        const age = Date.now() - item.timestamp;
-        if (age > API_CONFIG.CACHE_DURATION) {
+        if (Date.now() - item.timestamp > API_CONFIG.CACHE_DURATION) {
             this.cache.delete(key);
             return null;
         }
-        
         return item.data;
     }
-    
-    clearCache() {
-        this.cache.clear();
-        console.log('🗑️ Cache cleared');
-    }
-    
-    // ========================================================================
-    // PENDING REQUESTS QUEUE
-    // ========================================================================
-    
+
     async enqueuePendingRequest(endpoint, options = {}) {
-        const request = {
-            id: Math.random().toString(36),
-            endpoint,
-            options,
-            timestamp: Date.now()
-        };
-        
+        const request = { id: Math.random().toString(36), endpoint, options, timestamp: Date.now() };
         this.pendingRequests.push(request);
         this.savePendingRequests();
-        
-        console.log(`📋 Request queued (offline): ${endpoint}`);
         return request;
     }
-    
+
     savePendingRequests() {
-        try {
-            localStorage.setItem('ayno_pending_requests', JSON.stringify(this.pendingRequests));
-        } catch (e) {
-            console.error('Failed to save pending requests:', e);
-        }
+        try { localStorage.setItem('ayno_pending_requests', JSON.stringify(this.pendingRequests)); } catch (e) {}
     }
-    
+
     loadPendingRequests() {
         try {
             const stored = localStorage.getItem('ayno_pending_requests');
             this.pendingRequests = stored ? JSON.parse(stored) : [];
-            console.log(`📋 Loaded ${this.pendingRequests.length} pending requests`);
-        } catch (e) {
-            console.error('Failed to load pending requests:', e);
-            this.pendingRequests = [];
-        }
+        } catch (e) { this.pendingRequests = []; }
     }
-    
+
     async syncPendingRequests() {
         if (this.pendingRequests.length === 0) return;
-        
-        console.log(`🔄 Syncing ${this.pendingRequests.length} pending requests...`);
-        
         const failed = [];
-        for (const request of this.pendingRequests) {
-            try {
-                await this.request(request.endpoint, request.options);
-                console.log(`✅ Synced: ${request.endpoint}`);
-            } catch (error) {
-                console.error(`❌ Failed to sync: ${request.endpoint}`, error.message);
-                failed.push(request);
-            }
+        for (const req of this.pendingRequests) {
+            try { await this.request(req.endpoint, req.options); }
+            catch (e) { failed.push(req); }
         }
-        
         this.pendingRequests = failed;
         this.savePendingRequests();
-        
-        if (failed.length === 0) {
-            showNotification('✅ All pending requests synced', 'success');
-        } else {
-            showNotification(`⚠️ ${failed.length} requests still pending`, 'warning');
-        }
     }
-    
+
     // ========================================================================
-    // UI UPDATES
+    // PUBLIC ASYNC CLIENT METHODS (ADMIN & USER)
     // ========================================================================
-    
-    updateUI(status) {
-        const statusIndicator = document.getElementById('server-status-indicator');
-        if (!statusIndicator) {
-            const div = document.createElement('div');
-            div.id = 'server-status-indicator';
-            div.style.cssText = `
-                position: fixed;
-                top: 70px;
-                left: 20px;
-                padding: 8px 16px;
-                border-radius: 20px;
-                font-size: 12px;
-                font-weight: 600;
-                z-index: 9996;
-                backdrop-filter: blur(10px);
-                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            `;
-            document.body.appendChild(div);
-        }
-        
-        const statusConfig = {
-            'online': {
-                bg: '#DCFCE7',
-                text: '#166534',
-                icon: '🟢',
-                message: 'Online'
-            },
-            'offline': {
-                bg: '#FEE2E2',
-                text: '#991B1B',
-                icon: '🔴',
-                message: 'Offline Mode'
-            },
-            'server-down': {
-                bg: '#FEF3C7',
-                text: '#92400E',
-                icon: '🟡',
-                message: 'Server Connecting...'
-            }
-        };
-        
-        const config = statusConfig[status] || statusConfig['offline'];
-        document.getElementById('server-status-indicator').style.backgroundColor = config.bg;
-        document.getElementById('server-status-indicator').style.color = config.text;
-        document.getElementById('server-status-indicator').innerHTML = `
-            ${config.icon} ${config.message}
-        `;
-    }
-    
-    // ========================================================================
-    // PUBLIC API METHODS
-    // ========================================================================
-    
-    async fetchAppData() {
-        return this.request('/api/app-data', {}, true);
-    }
-    
-    async fetchUserData() {
-        const token = localStorage.getItem('tg_token');
-        return this.request('/api/user', {
-            headers: { 'Authorization': `Bearer ${token}` }
-        }, true);
-    }
-    
-    async createOrder(orderData) {
-        const token = localStorage.getItem('tg_token');
-        
-        // Queue if offline
-        if (this.isOffline) {
-            return this.enqueuePendingRequest('/api/orders', {
-                method: 'POST',
-                body: JSON.stringify(orderData),
-                headers: { 'Authorization': `Bearer ${token}` }
-            });
-        }
-        
-        return this.request('/api/orders', {
+
+    async loginViaTelegram() {
+        return this.request('/api/auth/telegram-login', {
             method: 'POST',
-            body: JSON.stringify(orderData),
-            headers: { 'Authorization': `Bearer ${token}` }
+            body: JSON.stringify({ initData: window.Telegram?.WebApp?.initData })
         }, false);
     }
-    
-    async uploadScreenshot(file) {
-        const token = localStorage.getItem('tg_token');
-        const formData = new FormData();
-        formData.append('screenshot', file);
-        
-        const fullUrl = `${API_CONFIG.BASE_URL}/api/verify-screenshot`;
-        
-        return new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', fullUrl);
-            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-            
-            xhr.timeout = API_CONFIG.TIMEOUT;
-            xhr.ontimeout = () => {
-                this.recordFailure('/api/verify-screenshot');
-                reject(new Error('Upload timeout - server may be down'));
-            };
-            
-            xhr.onerror = () => {
-                this.recordFailure('/api/verify-screenshot');
-                reject(new Error('Upload failed - network error'));
-            };
-            
-            xhr.onload = () => {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    this.recordSuccess('/api/verify-screenshot');
-                    try {
-                        resolve(JSON.parse(xhr.responseText));
-                    } catch (e) {
-                        reject(new Error('Invalid response format'));
-                    }
-                } else {
-                    this.recordFailure('/api/verify-screenshot');
-                    reject(new Error(`Upload failed: HTTP ${xhr.status}`));
-                }
-            };
-            
-            xhr.upload.onprogress = (event) => {
-                if (event.lengthComputable) {
-                    const progress = Math.round((event.loaded / event.total) * 100);
-                    console.log(`📤 Upload progress: ${progress}%`);
-                }
-            };
-            
-            xhr.send(formData);
-        });
+
+    async getAdminDashboardStats() {
+        return this.request('/api/admin/dashboard-stats', { method: 'GET' }, false);
     }
-    
-    getStatus() {
-        return {
-            serverHealthy: this.serverHealthy,
-            isOffline: this.isOffline,
-            lastHealthCheck: this.lastHealthCheck,
-            pendingRequests: this.pendingRequests.length,
-            cachedItems: this.cache.size,
-            circuitBreakers: Object.fromEntries(
-                Array.from(this.circuitBreaker.entries()).map(([k, v]) => [k, v.state])
-            )
-        };
+
+    async updateUserBalance(targetTgId, amount, action) {
+        return this.request('/api/admin/user/update-balance', {
+            method: 'POST',
+            body: JSON.stringify({ targetTgId, amount, action })
+        }, false);
+    }
+
+    async getPendingOrders() {
+        return this.request('/api/admin/orders/pending', { method: 'GET' }, false);
+    }
+
+    async manageOrder(orderId, status) {
+        return this.request('/api/admin/orders/manage', {
+            method: 'POST',
+            body: JSON.stringify({ orderId, status })
+        }, false);
     }
 }
 
-// ============================================================================
-// GLOBAL INSTANCE
-// ============================================================================
+// Module Export for Node Server & Global Window Instance for Frontend
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        registerExpressRoutes,
+        verifyTelegramInitData,
+        requireAdminAuth
+    };
+}
 
-const apiManager = new APIManager();
-window.apiManager = apiManager;
-
-console.log('✅ API Manager initialized - Railway server resilience enabled');
+if (typeof window !== 'undefined') {
+    window.apiManager = new APIManager();
+}
