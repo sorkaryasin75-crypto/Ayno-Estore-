@@ -1,4 +1,4 @@
-<!DOCTYPE html>   
+<!DOCTYPE html>
 
 <html lang="en">
 
@@ -110,9 +110,14 @@
     </style>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script defer src="/api-handler.js"></script>
+<style id="ayno-production-hardening">
+img{font-size:0;} img[src=""],img:not([src]){visibility:hidden;} .ayno-img-fallback{object-fit:contain;background:#f8fafc;}
+#server-status-badge{position:fixed;right:12px;bottom:92px;z-index:9998;font-size:11px;padding:7px 10px;border-radius:999px;background:#fff;border:1px solid #e2e8f0;box-shadow:0 8px 24px rgba(15,23,42,.08);display:none;}
+</style>
 </head>
 
 <body>
+<div id="server-status-badge">Server connecting…</div>
     <style>
         html.dark-mode {
             filter: invert(1) hue-rotate(180deg);
@@ -134,8 +139,8 @@
         <div class="w-20 h-20 bg-red-100 text-red-500 rounded-full flex items-center justify-center mb-6">
             <i class="fa-solid fa-wifi text-3xl opacity-50 relative"><i class="fa-solid fa-slash absolute left-0 top-0 text-red-600 font-bold"></i></i>
         </div>
-        <h2 class="text-2xl font-bold text-slate-800 mb-2">No Internet Connection</h2>
-        <p class="text-slate-500 mb-8 max-w-xs text-sm">Please check your network connection and try again.</p>
+        <h2 class="text-2xl font-bold text-slate-800 mb-2">Server Connection Unavailable</h2>
+        <p class="text-slate-500 mb-8 max-w-xs text-sm">The app is loaded, but the Ayno Store server is not responding right now. Please retry in a moment.</p>
         <button onclick="retryFetchAppData()" class="px-8 py-3.5 bg-indigo-600 text-white rounded-2xl font-bold shadow-lg shadow-indigo-200 hover:bg-indigo-700 hover:scale-105 transition-all active:scale-95 flex items-center gap-2">
             <i class="fa-solid fa-rotate-right"></i> Retry Connection
         </button>
@@ -902,7 +907,7 @@
                     <div id="home-profile-avatar" class="w-9 h-9 bg-indigo-50 rounded-full flex items-center justify-center border border-indigo-100 shadow-sm cursor-pointer overflow-hidden transition hover:scale-105"
                         onclick="switchTab('profile')">
                         <img id="home-avatar"
-                            src="https://ui-avatars.com/api/?name=Guest&background=E0E7FF&color=3730A3&size=100"
+                            src="/assets/logos/ayno-store.svg"
                             class="w-full h-full object-cover">
                     </div>
                     <!-- Guest Login Button -->
@@ -2334,7 +2339,7 @@
                         <!-- Nagad -->
                         <div class="hero-badge flex items-center gap-1.5 rounded-full px-2 py-1"
                             style="background: rgba(239,68,68,0.13); border: 1px solid rgba(239,68,68,0.35);">
-                            <img src="https://freelogopng.com/images/all_img/1679248787Nagad-Logo.png"
+                            <img src="/assets/logos/nagad.svg"
                                 class="w-4 h-4 rounded-full object-cover" style="background:#fff;">
                             <span class="text-[10px] font-bold text-[#fca5a5]">Nagad</span>
                         </div>
@@ -3738,7 +3743,7 @@
                         ${p.logoUrl
                             ? `<img src="${p.logoUrl}" class="w-12 h-12 rounded-xl object-cover bg-white shadow-sm" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIHZpZXdCb3g9IjAgMCA0OCA0OCI+PHJlY3Qgd2lkdGg9IjQ4IiBoZWlnaHQ9IjQ4IiBmaWxsPSIjZjhmOWZhIi8+PC9zdmc+'">`
                             : p.category === 'mail'
-                                ? `<img src="https://upload.wikimedia.org/wikipedia/commons/4/44/Microsoft_logo.svg" class="w-12 h-12 rounded-xl object-contain bg-white shadow-sm p-2">`
+                                ? `<img src="/assets/logos/outlook.svg" class="w-12 h-12 rounded-xl object-contain bg-white shadow-sm p-2">`
                                 : `<div class="w-12 h-12 rounded-xl flex items-center justify-center ${p.bgClass || (p.category === 'proxy' ? 'bg-purple-100 text-purple-500' : p.category === 'number' ? 'bg-blue-100 text-blue-500' : 'bg-green-100 text-green-500')}"><i class="${p.iconClass || (p.category === 'proxy' ? 'fa-solid fa-globe' : p.category === 'number' ? 'fa-solid fa-phone' : 'fa-solid fa-shield-halved')} text-2xl"></i></div>`
                         }
                         <div>
@@ -3772,7 +3777,7 @@
                     document.getElementById('selected-vpn-icon').innerHTML = `<img src="${currentVPN.logoUrl}" class="w-full h-full rounded-2xl object-cover" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIHZpZXdCb3g9IjAgMCA0OCA0OCI+PHJlY3Qgd2lkdGg9IjQ4IiBoZWlnaHQ9IjQ4IiBmaWxsPSIjZjhmOWZhIi8+PC9zdmc+'">`;
                 } else if (currentVPN.category === 'mail') {
                     document.getElementById('selected-vpn-icon').className = "w-16 h-16 mx-auto mb-2 rounded-2xl object-contain bg-white shadow-sm flex items-center justify-center p-3";
-                    document.getElementById('selected-vpn-icon').innerHTML = `<img src="https://upload.wikimedia.org/wikipedia/commons/4/44/Microsoft_logo.svg" class="w-full h-full object-contain">`;
+                    document.getElementById('selected-vpn-icon').innerHTML = `<img src="/assets/logos/outlook.svg" class="w-full h-full object-contain">`;
                 } else {
                     document.getElementById('selected-vpn-icon').className = `w-16 h-16 mx-auto mb-2 rounded-2xl flex items-center justify-center shadow-sm ${currentVPN.bgClass || (currentVPN.category === 'proxy' ? 'bg-purple-100 text-purple-500' : currentVPN.category === 'number' ? 'bg-blue-100 text-blue-500' : 'bg-green-100 text-green-500')}`;
                     document.getElementById('selected-vpn-icon').innerHTML = `<i class="${currentVPN.iconClass || (currentVPN.category === 'proxy' ? 'fa-solid fa-globe' : currentVPN.category === 'number' ? 'fa-solid fa-phone' : 'fa-solid fa-shield-halved')} text-3xl"></i>`;
@@ -6274,6 +6279,25 @@
                 }
             }
 
+            async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 12000) {
+                let lastError;
+                for (let attempt = 0; attempt <= retries; attempt++) {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), timeoutMs);
+                    try {
+                        const res = await fetch(url, { ...options, signal: controller.signal, cache: options.cache || 'no-store' });
+                        clearTimeout(timer);
+                        if (res.ok) return res;
+                        if (res.status >= 500 && attempt < retries) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
+                        return res;
+                    } catch (e) {
+                        clearTimeout(timer); lastError = e;
+                        if (attempt < retries) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                    }
+                }
+                throw lastError || new Error('Network request failed');
+            }
+
             async function fetchAppData(silent = false) {
                 try {
                     const urlParams = new URLSearchParams(window.location.search);
@@ -6313,7 +6337,7 @@
                     if (initData) { // ALWAYS re-auth if inside Telegram to prevent token hijacking
                         try {
                             uiLog("Sending auth request to /api/auth/telegram...");
-                            const authRes = await fetch('/api/auth/telegram', {
+                            const authRes = await fetchWithRetry('/api/auth/telegram', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', 'Bypass-Tunnel-Reminder': 'true' },
                                 body: JSON.stringify({ initData })
@@ -6350,7 +6374,7 @@
 
                     try {
                         uiLog("Sending data request to /api/data with cache-busting...");
-                        const res = await fetch('/api/data?t=' + new Date().getTime(), { headers, cache: 'no-store' });
+                        const res = await fetchWithRetry('/api/data?t=' + new Date().getTime(), { headers, cache: 'no-store' }, 3, 10000);
                         const data = await res.json();
 
                         if (!data.user && window.appData.user) {
@@ -7777,7 +7801,7 @@
                                 class="w-20 h-20 md:w-24 md:h-24 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-full p-[2px]">
                                 <img id="profile-avatar" alt="Avatar"
                                     class="w-full h-full rounded-full border-2 border-white object-cover"
-                                    src="https://ui-avatars.com/api/?name=Guest&background=E0E7FF&color=3730A3&size=100" />
+                                    src="/assets/logos/ayno-store.svg" />
                             </div>
                             <button
                                 onclick="document.getElementById('avatar-upload-input').click()"
