@@ -201,6 +201,11 @@ class APIManager {
         const fullUrl = `${API_CONFIG.BASE_URL}${endpoint}`;
         const method = (options.method || 'GET').toUpperCase();
         const cacheKey = `${method}:${fullUrl}`;
+        // V3: every state-changing request gets one stable idempotency key so retries cannot double-charge.
+        const requestOptions = { ...options, headers: { ...(options.headers || {}) } };
+        if (!['GET','HEAD','OPTIONS'].includes(method) && !requestOptions.headers['Idempotency-Key'] && !requestOptions.headers['idempotency-key']) {
+            requestOptions.headers['Idempotency-Key'] = (crypto?.randomUUID ? crypto.randomUUID() : `ayno-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+        }
         
         // Check circuit breaker
         if (this.isCircuitBreakerOpen(endpoint)) {
@@ -227,7 +232,7 @@ class APIManager {
         let lastError;
         for (let attempt = 0; attempt <= API_CONFIG.RETRY_MAX; attempt++) {
             try {
-                const response = await this.fetchWithTimeout(fullUrl, options, API_CONFIG.TIMEOUT);
+                const response = await this.fetchWithTimeout(fullUrl, requestOptions, API_CONFIG.TIMEOUT);
                 
                 if (!response.ok) {
                     if (response.status === 503 || response.status === 502 || response.status === 504) {
