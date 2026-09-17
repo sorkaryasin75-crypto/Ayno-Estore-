@@ -1,0 +1,35 @@
+{
+  "users": {},
+  "orders": [],
+  "withdrawals": [],
+  "verifications": [],
+  "reviews": [],
+  "transfers": [],
+  "logs": [],
+  "coupons": [],
+  "products": [
+    {"id":"p1","name":"NordVPN Premium","category":"vpn","price":30,"stock":true,"isAvailable":true,"isHidden":false,"logoUrl":"/assets/logos/nordvpn.svg","plans":[{"name":"1 Month","price":30},{"name":"6 Months","price":150}]},
+    {"id":"p2","name":"Residential Proxy","category":"proxy","price":150,"pricePerGb":150,"stock":true,"isAvailable":true,"isHidden":false,"logoUrl":"/assets/logos/proxy.svg","plans":[]},
+    {"id":"p3","name":"Outlook / Hotmail Mail","category":"mail","price":1,"stock":true,"isAvailable":true,"isHidden":false,"logoUrl":"/assets/logos/outlook.svg","plans":[]},
+    {"id":"p4","name":"Telegram Premium","category":"app","price":250,"stock":true,"isAvailable":true,"isHidden":false,"logoUrl":"/assets/logos/telegram.svg","plans":[]},
+    {"id":"p5","name":"USA Virtual Number","category":"number","price":8,"stock":true,"isAvailable":true,"isHidden":false,"logoUrl":"/assets/logos/number.svg","plans":[]}
+  ],
+  "settings": {
+    "maintenance": false,
+    "minWithdraw": 50,
+    "minAddBalance": 50,
+    "rewardEnabled": true,
+    "coinSystemEnabled": true,
+    "coinRateVpn": 100,
+    "coinRateProxy": 100,
+    "coinRateMail": 100,
+    "referralBonus": 0,
+    "leaderboardEnabled": true,
+    "paymentMethods": [
+      {"id":"bk","name":"bKash","number":"01700000000","logoUrl":"/assets/logos/bkash.svg","enabled":true},
+      {"id":"ng","name":"Nagad","number":"01700000000","logoUrl":"/assets/logos/nagad.svg","enabled":true}
+    ]
+  },
+  "smsServices": [],
+  "smsCountries": {}
+}
