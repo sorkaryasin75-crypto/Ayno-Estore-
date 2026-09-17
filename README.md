@@ -1,32 +1,46 @@
-# Ayno Store — Production Repair Build
+# Ayno Store V3
 
-This build repairs the supplied frontend/backend contract and adds a secure Telegram-admin management API plus `admin.html`.
+Production-oriented Ayno Store build based on V2. V3 focuses on the remaining high-risk areas identified in the project audit: financial consistency, duplicate-request protection, order state control, Telegram webhook hardening, provider adapters, auditability, and Railway/PostgreSQL deployment hygiene.
 
-## What was repaired
-- Added the missing `/api/*` routes used by the supplied `index.html` instead of leaving them as 404s.
-- Added secure Telegram Web App `initData` validation for `/api/auth/telegram`.
-- Added admin authorization based on `ADMIN_TELEGRAM_IDS` and the persisted user role.
-- Added product CRUD, user management, order management, withdrawal management, verification management and settings APIs.
-- Added `admin.html` and connected it to the backend.
-- Added local SVG logo assets so the storefront does not depend on missing local files or third-party image hosts for the main product/payment/service logos.
-- Fixed the syntax error in `resilience-utils.js`.
-- Fixed browser-side `process.env.REACT_APP_API_URL` usage in `api-handler.js`.
-- Added JSON persistence with atomic temp-file replacement.
-- Kept external providers configurable; unsupported providers return controlled JSON errors instead of silently creating fake successful transactions.
+## V3 changes
+- PostgreSQL financial wallet ledger with row-level locking (`FOR UPDATE`).
+- Atomic wallet debit/credit and atomic two-user transfer.
+- Withdrawal holds and refund-on-rejection use the ledger when PostgreSQL is enabled.
+- Idempotency-Key protection for important state-changing requests.
+- Order state machine prevents arbitrary status jumps.
+- `/api/ledger` exposes the authenticated user's ledger history when PostgreSQL is enabled.
+- `/api/system-status` exposes non-secret runtime capability status.
+- Telegram webhook can use `TELEGRAM_WEBHOOK_SECRET`.
+- SMSBower adapter performs real provider HTTP requests when configured; it never reports fake success when credentials are absent.
+- Admin withdrawal handling is safer and audited.
+- V3 static smoke test is included.
+- `data.json` is ignored by Git so runtime fallback data is not accidentally committed.
 
-## Production configuration
-Copy `.env.example` to `.env` and set at minimum:
-- `JWT_SECRET`
-- `ADMIN_TELEGRAM_IDS`
-- `TELEGRAM_BOT_TOKEN` if Telegram authentication/bot features are used
-- payment numbers
-- provider API keys when external providers are actually connected
+## Railway setup
+1. Deploy this folder from GitHub.
+2. Add a PostgreSQL service and connect its `DATABASE_URL` to this service.
+3. Set a strong `JWT_SECRET` (32+ random characters).
+4. Set `ADMIN_TELEGRAM_IDS` to the Telegram numeric IDs of administrators.
+5. Set `TELEGRAM_BOT_TOKEN`.
+6. Set `WEBHOOK_URL` to the public Railway URL if using webhook mode.
+7. Optionally set `TELEGRAM_WEBHOOK_SECRET`.
+8. Set provider credentials only when the corresponding provider account is actually available.
+9. Use `/health` as the Railway healthcheck.
 
-## Start
+Railway injects `PORT`; do not hard-code a production `PORT` environment variable unless you have a specific reason.
+
+## Database migration behavior
+On first PostgreSQL startup V3 creates its tables automatically. Existing balances from `data.json` are copied into `ayno_wallets` once using the `ayno_meta` migration flag. After that, the PostgreSQL wallet ledger is authoritative for financial mutations.
+
+## Important provider behavior
+The project contains endpoint coverage and provider adapters, but provider fulfillment still requires valid third-party credentials and the exact service/country IDs used by the provider. V3 intentionally returns an explicit configuration/provider error instead of pretending a purchase or OTP was completed.
+
+## Test
 ```bash
 npm install
+npm test
 npm start
 ```
 
-## Important
-The supplied project did not contain working provider credentials or provider adapters for SMS/mail/external fulfillment. This repair therefore does **not** pretend those providers are connected. `/api/buy-external`, `/api/get-otp`, and `/api/mail/inbox` expose controlled integration points; real fulfillment requires the corresponding provider credentials/API contract.
+## Production note
+A real production launch still requires a live Railway deployment test, Telegram Web App authentication test, PostgreSQL connection test, and real provider credential tests. Those cannot be truthfully marked as passed from static source inspection alone.
